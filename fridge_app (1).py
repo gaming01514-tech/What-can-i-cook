@@ -17,7 +17,7 @@ from google.genai import types
 # ---------- PAGE SETUP ----------
 st.set_page_config(page_title="What Can I Cook?", page_icon="🍳", layout="wide")
 st.title("🍳 What Can I Cook?")
-st.success("Version 3: auto-retry when Google is busy")
+st.success("Version 4: no more endless loading when Google is busy")
 st.write("Snap a photo of your fridge and get recipes, macros, and a meal plan for the week.")
 
 
@@ -40,9 +40,21 @@ BACKUP_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"
 
 
 # ---------- HELPER: ASK THE AI ----------
+REQUEST_TIMEOUT_SECONDS = 45     # give up on a single request after this long
+TOTAL_TIME_LIMIT_SECONDS = 90    # give up on everything after this long
+
+
 def ask_ai(prompt, image_bytes=None, image_type=None):
     """Sends a question (and maybe a picture) to Gemini and returns its answer as Python data."""
-    client = genai.Client(api_key=api_key)
+    # Without a timeout, a stuck request makes the page spin forever.
+    # We also turn off the library's own retries because we do our own below.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_SECONDS * 1000,    # in milliseconds
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
     contents = []
     if image_bytes is not None:
@@ -52,9 +64,13 @@ def ask_ai(prompt, image_bytes=None, image_type=None):
     # Try the chosen model first, then backup models if Google is busy.
     models_to_try = [model_name] + [m for m in BACKUP_MODELS if m != model_name]
     last_error = None
+    started = time.time()
 
     for model in models_to_try:
-        for attempt in range(3):                      # try each model up to 3 times
+        for attempt in range(2):                      # try each model up to 2 times
+            if time.time() - started > TOTAL_TIME_LIMIT_SECONDS:
+                raise Exception("Google's AI is taking too long right now. "
+                                f"Wait a minute and try again. ({last_error})")
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -65,13 +81,15 @@ def ask_ai(prompt, image_bytes=None, image_type=None):
             except Exception as error:
                 last_error = error
                 message = str(error)
+                timed_out = "timed out" in message.lower() or "timeout" in type(error).__name__.lower()
+                out_of_quota = "RESOURCE_EXHAUSTED" in message or "quota" in message.lower()
                 busy = "503" in message or "429" in message or "UNAVAILABLE" in message
                 missing = "404" in message or "NOT_FOUND" in message
-                if missing:
-                    break                             # model doesn't exist, go to next model
+                if missing or timed_out or out_of_quota:
+                    break                             # waiting won't help, go to next model
                 if not busy:
                     raise                             # some other problem, show it
-                time.sleep(2 * (attempt + 1))         # busy: wait 2s, 4s, 6s, then retry
+                time.sleep(3)                         # busy: wait a moment, then retry
 
     raise Exception(f"Google's AI is very busy right now. Wait a minute and try again. ({last_error})")
 
