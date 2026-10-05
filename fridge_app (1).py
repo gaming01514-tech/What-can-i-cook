@@ -8,6 +8,7 @@
 
 import json                      # turns the AI's text answer into Python data
 import datetime                  # figures out what day it is today
+import time                      # lets the app wait a few seconds before retrying
 import streamlit as st           # makes the web page
 from google import genai         # talks to Google's Gemini AI
 from google.genai import types
@@ -16,6 +17,7 @@ from google.genai import types
 # ---------- PAGE SETUP ----------
 st.set_page_config(page_title="What Can I Cook?", page_icon="🍳", layout="wide")
 st.title("🍳 What Can I Cook?")
+st.success("Version 3: auto-retry when Google is busy")
 st.write("Snap a photo of your fridge and get recipes, macros, and a meal plan for the week.")
 
 
@@ -33,6 +35,9 @@ except Exception:
 
 model_name = st.sidebar.text_input("AI model", value="gemini-3.8-flash")
 
+# If the main model is busy, the app automatically tries these, in order.
+BACKUP_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+
 
 # ---------- HELPER: ASK THE AI ----------
 def ask_ai(prompt, image_bytes=None, image_type=None):
@@ -44,12 +49,31 @@ def ask_ai(prompt, image_bytes=None, image_type=None):
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type=image_type))
     contents.append(prompt)
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    return json.loads(response.text)
+    # Try the chosen model first, then backup models if Google is busy.
+    models_to_try = [model_name] + [m for m in BACKUP_MODELS if m != model_name]
+    last_error = None
+
+    for model in models_to_try:
+        for attempt in range(3):                      # try each model up to 3 times
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                return json.loads(response.text)  # it worked!
+            except Exception as error:
+                last_error = error
+                message = str(error)
+                busy = "503" in message or "429" in message or "UNAVAILABLE" in message
+                missing = "404" in message or "NOT_FOUND" in message
+                if missing:
+                    break                             # model doesn't exist, go to next model
+                if not busy:
+                    raise                             # some other problem, show it
+                time.sleep(2 * (attempt + 1))         # busy: wait 2s, 4s, 6s, then retry
+
+    raise Exception(f"Google's AI is very busy right now. Wait a minute and try again. ({last_error})")
 
 
 # ---------- HELPER: WHICH DAYS ARE LEFT THIS WEEK? ----------
